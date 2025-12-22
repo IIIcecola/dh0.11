@@ -37,13 +37,19 @@ class WarmupCosineScheduler(torch.optim.lr_scheduler._LRScheduler):
       lrs.append(lr)
     return lrs
 
-# 新增参数writer
-def train(model, dataloader, optimizer, scheduler, criterion, device, epochs, writer):
+def train(model, dataloader, optimizer, scheduler, criterion, device, epochs, writer, module_loss_weight):
+  """
+  新增训练可视化，多源数据loss权重控制及可视化解耦
+  :param writer: tensorboard的writer参数
+  :param module_loss_weight: 多源数据loss权重
+  """
+  
   model.train()
-
+  criterion.reduction = "none" # 改为"none"以获取每个样本的原始loss
+  
   for epoch in range(epoches):
     total_loss = 0.0
-    for step, (audio_feat, target) in enumerate(dataloader):
+    for step, (audio_feat, target, module_labels) in enumerate(dataloader):
       # audio_feat: (B, 249, 768)
       # target: (B, 125, 136)
   
@@ -53,22 +59,29 @@ def train(model, dataloader, optimizer, scheduler, criterion, device, epochs, wr
       optimizer.zero_grad()
   
       output = model(audio_feat)
-      loss = criterion(output, target)
-  
-      loss.backward()
+      # 新增：多数据源loss权重控制及可视化解耦
+      # 1. 计算每个样本的原始loss（保留batch维度）
+      sample_raw_loss = criterion(output, target).mean(dim=(1, 2))
+      # 2. 应用模块loss权重
+      sample_weighted_loss = []
+      for loss, module in zip(sample_raw_loss, module_labels):
+          # 根据样本所属模块获取loss权重
+          weight = module_loss_weight[module]
+          sample_weighted_loss.append(loss * weight)
+      # 3. 计算batch总损失并反向传播
+      batch_loss = torch.stack(sample_weighted_loss).mean()  # 也可使用sum()
+      batch_loss.backward()
       optimizer.step()
       scheduler.step()
-  
-      total_loss += loss.item()
-
-      # 新增
+      # 4. 日志记录（新增模块loss监控）
+      total_loss += batch_loss.item()
       # 记录step级别的损失和学习率
       global_step = epoch * len(dataloader) + step
-      writer.add_scalar('Train/Step Loss', loss.item(), global_step)
+      writer.add_scalar('Train/Step Loss', batch_loss.item(), global_step)
+      lr = scheduler.get_last_lr()[0]
       writer.add_scalar('Train/Learning Rate', lr, global_step)
   
       if step % 20 == 0:
-        lr = scheduler.get_last_lr()[0]
         print(
           f"[Epoch {epoch+1}/{epoches}]"
           f"Step {step}/{len(dataloader)}"
@@ -76,7 +89,7 @@ def train(model, dataloader, optimizer, scheduler, criterion, device, epochs, wr
           f"LR: {lr:.8f}"
         )
       avg_loss = total_loss / len(dataloader)
-      # 新增
+
       # 记录epoch级别的平均损失
       writer.add_scalar('Train/Epoch Avg Loss', avg_loss, epoch)
       print(f"==== Epoch {epoch+1} Avg Loss: {avg_loss:.6f} ====")
@@ -103,36 +116,49 @@ if __name__ == "__main__":
   
   os.makedirs(os.path.dirname(config.save_path), exists_ok=True)
 
-  # 新增
+  # 新增：训练可视化
   # 创建TensorBoard日志目录
   timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
   log_dir = os.path.join(os.path.dirname(config.save_path), "tensorboard_logs", timestamp)
   os.makedirs(log_dir, exist_ok=True)
   writer = SummaryWriter(log_dir=log_dir)
-
+  
   processor = None
   wav2vec2_model = None
   if config.dataset.use_processor:
     processor = Wav2Vec2Peocessor.from_pretrained(config.wav2vec2.path)
     wav2vec2_model = Wav2Vec2Model.from_pretrained(config.wav2vec2.path)
 
+  # 新增：多源数据采样概率控制
+  # 1. 读取多模块配置
+  module_mapping = config.dataset.module_mapping  # {模块名: {"path": 路径, "sample_num": 总样本数}}
+  module_sample_weight = config.dataset.module_sample_weight  # 采样权重
+  module_loss_weight = config.dataset.module_loss_weight      # loss权重
+  # 2. 初始化多模块数据集（替换原单路径dataset）
   dataset = AudioDataset(
     processor=processor,
     model=wav2vec2_model,
-    cache_path=config.dataset.cache_path
+    cache_path=module_mapping
   )
-
-  dataset.generateSample(
-    seconds=config.dataset.seconds,
-    load_flag=config.dataset.load_flag
+  # 3. 生成样本级采样权重
+  sample_weights = torch.tensor(
+      [module_sample_weight[module_label] for module_label in dataset.module_labels],
+      dtype=torch.float32
   )
-
+  # 4. 创建加权采样器
+  sampler = WeightedRandomSampler(
+      weights=sample_weights,
+      num_samples=len(dataset),
+      replacement=True
+  )
+  # 5. 创建DataLoader（使用采样器，关闭shuffle）
   dataloader = DataLoader(
-    dataset,
-    batch_size=config.dataset.batch_size,
-    shuffle=config.dataset.shuffle,
-    num_workers=config.dataset.num_workers,
-    pin_memory=config.dataset.pin_memory
+      dataset,
+      batch_size=config.dataset.batch_size,
+      sampler=sampler,  # 使用加权采样器
+      shuffle=False,    # 采样器已控制随机性
+      num_workers=config.dataset.num_workers,
+      pin_memory=config.dataset.pin_memory
   )
 
   decoderModel = TransformerStackDecoder(
