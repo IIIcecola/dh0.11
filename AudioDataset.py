@@ -19,6 +19,18 @@ from PreProcess import ctrl_expressions as ctrl_expressions_list
 import pickle
 from matplotlib.ticker import MaxNLocator
 
+def pack_up(exp, save_path):
+    ''' '''
+    N = len(exp)
+    motion_pred = np.zeros((N, 55*3)).tolist()
+    face_pred = exp
+    transfer_motion = {
+        "motion_pred": motion_pred,
+        "face_pred": face_pred,
+        "fps": 25,
+        "frames": N,
+    }
+
 class UE_CurvesManager:
     def __init__(self,json_path):
         self.json_path = json_path
@@ -283,42 +295,42 @@ class WavSample:
     
 
 class AudioDataset(Dataset):
-    def __init__(self,processor, model, module_mapping):
+    def __init__(self,processor, model, config):
         """
         多模块音频数据集：支持从多个模块路径加载数据，并记录样本所属模块
         :param module_mapping: 字典，格式为 {模块名: {"path": 模块数据路径, "sample_num": 样本数量}}
         :param processor: 原有的wav2vec2处理器
         :param model: 原有的wav2vec2模型
         """  
-        self.json_path = './Dataset/zhuboshuolianbo/json/'
-        self.wav_path = './Dataset/zhuboshuolianbo/wav/'
-        self.cache_path = cache_path
-
-        
-        self.video_list = []
-        self.initializeVideoList()
-
-        self.wavSampleManagerList = []
-
         self.processor = processor 
         self.model = model 
-
-        if processor is not None:
-            for _video in self.video_list:
-                j_p = os.path.join(self.json_path,'CD_'+_video+'_1.json')
-                w_p = os.path.join(self.wav_path,_video+'.wav')
-                wavSample = WavSample(j_p, w_p, processor=processor, model=model)
-                self.wavSampleManagerList.append(wavSample)
-
+        self.cache_path = config.get('cache_path', None)
+        self.datasets_path = config.get('datasets', None)
+        if self.cache_path is None:
+            try:
+                self.json_path = './Dataset/zhuboshuolianbo/json/'
+                self.wav_path = './Dataset/zhuboshuolianbo/wav/'
+                self.video_list = []
+                self.initializeVideoList()
+                self.wavSampleManagerList = []
+                if processor is not None:
+                    for _video in self.video_list:
+                        j_p = os.path.join(self.json_path,'CD_'+_video+'_1.json')
+                        w_p = os.path.join(self.wav_path,_video+'.wav')
+                        wavSample = WavSample(j_p, w_p, processor=processor, model=model)
+                        self.wavSampleManagerList.append(wavSample)
+            except ExceptionTtpe as e:
+                raise AnotherException('载入数据集错误') from e
+                
         self.input_list = [] 
         self.output_list = []
 
         # 新增
-        self.module_mapping = module_mapping
+        self.module_mapping = config.module_mapping
         self.samples = []  # 存储所有模块的样本
         self.module_labels = []  # 存储每个样本的模块标签
         # 遍历每个模块，加载样本并绑定标签
-        for module_name, module_info in module_mapping.items():
+        for module_name, module_info in self.module_mapping.items():
             module_path = module_info["path"]  # 模块的缓存路径
             sample_num = module_info["sample_num"]  # 该模块需要加载的样本数量
 
